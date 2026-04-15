@@ -321,10 +321,12 @@
 
   const API_URL = 'https://34a5iq08zd.execute-api.eu-west-2.amazonaws.com/prod/optimise';
 
+  let pollInterval = null;
+
   optimiseBtn.addEventListener('click', async () => {
     if (!selectedFile) return;
-    const text = await selectedFile.text();
-    const products = parseCSV(text);
+    const csvText = await selectedFile.text();
+    const products = parseCSV(csvText);
     if (!products.length) { showToast('No products found. Check your CSV format.'); return; }
 
     startTime = Date.now();
@@ -332,6 +334,7 @@
     progressSection.classList.add('visible');
     document.getElementById('progress-count').textContent = '0 / ' + products.length;
 
+    // Build product list UI
     productList.innerHTML = '';
     products.forEach((p, i) => {
       const name = (p.title || p.asin || 'Product ' + (i+1)).substring(0, 52);
@@ -346,56 +349,101 @@
       </div>`;
     });
 
-    // Animate progress while API processes all products at once
-    let fakeIdx = 0;
-    const fakeInterval = setInterval(() => {
-      if (fakeIdx < products.length) {
-        const item = document.getElementById('item-' + fakeIdx);
-        if (fakeIdx > 0) {
-          const prev = document.getElementById('item-' + (fakeIdx-1));
-          prev.classList.remove('processing'); prev.classList.add('done');
-          document.getElementById('score-' + (fakeIdx-1)).textContent = '✓';
-          document.getElementById('progress-count').textContent = fakeIdx + ' / ' + products.length;
-        }
-        item.classList.add('processing');
-        item.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        updateProgress(fakeIdx, products.length, 'Optimising: ' + (products[fakeIdx].title||'product').substring(0,35) + '...');
-        fakeIdx++;
-      }
-    }, Math.max(300, 45000 / products.length));
+    // Mark first item as processing
+    document.getElementById('item-0').classList.add('processing');
+    updateProgress(0, products.length, 'Sending to AI...');
 
     try {
-      const csvText = await selectedFile.text();
-      const response = await fetch(API_URL, {
+      // Step 1: POST CSV, get job ID back instantly
+      const postRes = await fetch(API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'text/plain' },
         body: csvText
       });
 
-      clearInterval(fakeInterval);
-
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.error || 'API error ' + response.status);
+      if (!postRes.ok) {
+        const err = await postRes.json().catch(() => ({}));
+        throw new Error(err.error || 'Failed to start job');
       }
 
-      const data = await response.json();
-      if (!data.success) throw new Error(data.error || 'Optimisation failed');
+      const job = await postRes.json();
+      const jobId = job.job_id;
+      const total = job.total_products || products.length;
 
-      // Mark all done with scores from preview
-      for (let i = 0; i < products.length; i++) {
-        const item = document.getElementById('item-' + i);
-        item.classList.remove('processing'); item.classList.add('done');
-        const score = data.preview && data.preview[i] ? data.preview[i].listing_score : null;
-        document.getElementById('score-' + i).textContent = score ? score + '/100' : '✓';
-      }
-      document.getElementById('progress-count').textContent = products.length + ' / ' + products.length;
-      updateProgress(products.length, products.length, 'Complete');
+      updateProgress(0, total, 'Job started, AI is processing...');
 
-      showSuccess(data, Date.now() - startTime);
+      // Step 2: Poll for status every 3 seconds
+      let lastProcessed = 0;
+      pollInterval = setInterval(async () => {
+        try {
+          const statusRes = await fetch(`${API_URL}?job_id=${jobId}`);
+          const status = await statusRes.json();
+
+          const done = Number(status.products_processed) || 0;
+
+          // Update product items up to current progress
+          for (let i = lastProcessed; i < done; i++) {
+            const item = document.getElementById('item-' + i);
+            if (item) {
+              item.classList.remove('processing');
+              item.classList.add('done');
+              document.getElementById('score-' + i).textContent = '✓';
+            }
+          }
+
+          // Mark next item as processing
+          if (done < total) {
+            const next = document.getElementById('item-' + done);
+            if (next) {
+              next.classList.add('processing');
+              next.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+            }
+          }
+
+          lastProcessed = done;
+          document.getElementById('progress-count').textContent = done + ' / ' + total;
+          updateProgress(done, total, `Optimising product ${done + 1} of ${total}...`);
+
+          // Job complete
+          if (status.status === 'complete') {
+            clearInterval(pollInterval);
+
+            // Mark all done
+            for (let i = 0; i < total; i++) {
+              const item = document.getElementById('item-' + i);
+              if (item) { item.classList.remove('processing'); item.classList.add('done'); }
+              const scoreEl = document.getElementById('score-' + i);
+              if (scoreEl && status.preview && status.preview[i]) {
+                scoreEl.textContent = status.preview[i].listing_score + '/100';
+              } else if (scoreEl) {
+                scoreEl.textContent = '✓';
+              }
+            }
+
+            document.getElementById('progress-count').textContent = total + ' / ' + total;
+            updateProgress(total, total, 'Complete');
+            showSuccess(status, Date.now() - startTime);
+          }
+
+          if (status.status === 'error') {
+            clearInterval(pollInterval);
+            throw new Error(status.error || 'Processing failed');
+          }
+
+        } catch(pollErr) {
+          if (pollErr.message !== 'Processing failed') {
+            console.error('Poll error:', pollErr);
+          } else {
+            clearInterval(pollInterval);
+            optimiseBtn.disabled = false;
+            progressSection.classList.remove('visible');
+            showToast('Error: ' + pollErr.message);
+          }
+        }
+      }, 3000);
 
     } catch(err) {
-      clearInterval(fakeInterval);
+      if (pollInterval) clearInterval(pollInterval);
       optimiseBtn.disabled = false;
       progressSection.classList.remove('visible');
       showToast('Error: ' + err.message);
@@ -422,6 +470,7 @@
   }
 
   document.getElementById('reset-btn').addEventListener('click', () => {
+    if (pollInterval) clearInterval(pollInterval);
     selectedFile = null; fileInput.value = '';
     fileSelected.classList.remove('visible'); optimiseBtn.disabled = true;
     progressSection.classList.remove('visible'); successSection.classList.remove('visible');

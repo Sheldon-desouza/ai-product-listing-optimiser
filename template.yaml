@@ -92,34 +92,39 @@ Resources:
             Version: '2012-10-17'
             Statement:
 
-              # Read from input bucket
               - Effect: Allow
                 Action:
                   - s3:GetObject
                   - s3:GetObjectVersion
                 Resource: !Sub "arn:aws:s3:::${ProjectName}-input-${AWS::AccountId}/*"
 
-              # Write to output bucket
               - Effect: Allow
                 Action:
                   - s3:PutObject
                   - s3:PutObjectAcl
+                  - s3:GetObject
                 Resource: !Sub "arn:aws:s3:::${ProjectName}-output-${AWS::AccountId}/*"
 
-              # Invoke Bedrock model
               - Effect: Allow
                 Action:
                   - bedrock:InvokeModel
                   - bedrock:InvokeModelWithResponseStream
-                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
 
-              # Publish to SNS topic
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                  - aws-marketplace:Unsubscribe
+                Resource: "*"
+
               - Effect: Allow
                 Action:
                   - sns:Publish
                 Resource: !Ref NotificationTopic
 
-              # Write logs to CloudWatch
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
@@ -139,7 +144,7 @@ Resources:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: !Sub "${ProjectName}-optimiser"
-      Description: Triggered by S3 upload; reads product CSV, calls Bedrock, writes optimised CSV
+      Description: Triggered by S3 upload or API Gateway; reads product CSV, calls Bedrock, writes optimised CSV
       Runtime: python3.12
       Handler: index.handler
       Role: !GetAtt LambdaExecutionRole.Arn
@@ -159,6 +164,7 @@ Resources:
           import os
           import logging
           import io
+          import base64
           from datetime import datetime
 
           logger = logging.getLogger()
@@ -172,12 +178,17 @@ Resources:
           SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
           BEDROCK_MODEL_ID = os.environ['BEDROCK_MODEL_ID']
 
+          CORS_HEADERS = {
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Headers': 'Content-Type',
+              'Access-Control-Allow-Methods': 'OPTIONS,POST'
+          }
+
           def optimise_listing(product):
-              """Send a single product to Bedrock for listing optimisation."""
               prompt = f"""You are an expert Amazon listing copywriter.
           Optimise the following product listing for Amazon search (Rufus/A9 algorithm).
 
-          Return ONLY valid JSON with these fields:
+          Return ONLY valid JSON with these exact fields:
           - optimised_title (max 200 chars, keyword-rich)
           - bullet_1 through bullet_5 (benefit-led, max 255 chars each)
           - optimised_description (max 2000 chars, paragraph form)
@@ -211,62 +222,127 @@ Resources:
               text = result['content'][0]['text']
               return json.loads(text)
 
+          def process_products(products):
+              results = []
+              total = len(products)
+              for i, product in enumerate(products):
+                  logger.info(f"Optimising product {i+1}/{total}: {product.get('title','')[:50]}")
+                  try:
+                      optimised = optimise_listing(product)
+                      results.append({**product, **optimised})
+                  except Exception as e:
+                      logger.error(f"Failed to optimise product {i+1}: {str(e)}")
+                      results.append({
+                          **product,
+                          'optimised_title': 'ERROR - could not optimise',
+                          'bullet_1': str(e),
+                          'bullet_2': '', 'bullet_3': '', 'bullet_4': '', 'bullet_5': '',
+                          'optimised_description': '',
+                          'listing_score': 0,
+                          'score_notes': 'Processing failed'
+                      })
+              return results
+
+          def write_output_csv(results, filename):
+              timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+              output_key = f"optimised/{timestamp}-{filename}"
+              output_buffer = io.StringIO()
+              fieldnames = list(results[0].keys())
+              writer = csv.DictWriter(output_buffer, fieldnames=fieldnames)
+              writer.writeheader()
+              writer.writerows(results)
+              s3.put_object(
+                  Bucket=OUTPUT_BUCKET,
+                  Key=output_key,
+                  Body=output_buffer.getvalue().encode('utf-8'),
+                  ContentType='text/csv'
+              )
+              return output_key
+
+          def generate_presigned_url(key):
+              return s3.generate_presigned_url(
+                  'get_object',
+                  Params={'Bucket': OUTPUT_BUCKET, 'Key': key},
+                  ExpiresIn=3600
+              )
+
           def handler(event, context):
               logger.info(f"Event received: {json.dumps(event)}")
 
-              for record in event['Records']:
+              # CORS preflight
+              if event.get('httpMethod') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': ''}
+
+              # API Gateway POST request from website
+              if event.get('httpMethod') == 'POST':
+                  try:
+                      body = event.get('body', '')
+                      if event.get('isBase64Encoded'):
+                          body = base64.b64decode(body).decode('utf-8')
+
+                      reader = csv.DictReader(io.StringIO(body))
+                      products = list(reader)
+
+                      if not products:
+                          return {
+                              'statusCode': 400,
+                              'headers': CORS_HEADERS,
+                              'body': json.dumps({'error': 'No products found in CSV'})
+                          }
+
+                      logger.info(f"API request: processing {len(products)} products")
+                      results = process_products(products)
+                      output_key = write_output_csv(results, 'web-upload.csv')
+                      download_url = generate_presigned_url(output_key)
+
+                      scores = [r.get('listing_score', 0) for r in results if isinstance(r.get('listing_score'), int)]
+                      avg_score = round(sum(scores) / len(scores)) if scores else 0
+
+                      return {
+                          'statusCode': 200,
+                          'headers': CORS_HEADERS,
+                          'body': json.dumps({
+                              'success': True,
+                              'products_processed': len(results),
+                              'average_score': avg_score,
+                              'download_url': download_url,
+                              'preview': [
+                                  {
+                                      'original_title': r.get('title', ''),
+                                      'optimised_title': r.get('optimised_title', ''),
+                                      'listing_score': r.get('listing_score', 0),
+                                      'score_notes': r.get('score_notes', '')
+                                  }
+                                  for r in results[:3]
+                              ]
+                          })
+                      }
+
+                  except Exception as e:
+                      logger.error(f"API error: {str(e)}")
+                      return {
+                          'statusCode': 500,
+                          'headers': CORS_HEADERS,
+                          'body': json.dumps({'error': str(e)})
+                      }
+
+              # S3 trigger (original flow)
+              for record in event.get('Records', []):
                   bucket = record['s3']['bucket']['name']
                   key = record['s3']['object']['key']
-                  logger.info(f"Processing file: s3://{bucket}/{key}")
-
-                  # Read CSV from input bucket
+                  logger.info(f"S3 trigger: processing s3://{bucket}/{key}")
                   obj = s3.get_object(Bucket=bucket, Key=key)
                   content = obj['Body'].read().decode('utf-8')
                   reader = csv.DictReader(io.StringIO(content))
                   products = list(reader)
-                  logger.info(f"Found {len(products)} products to optimise")
-
-                  # Optimise each product
-                  results = []
-                  for i, product in enumerate(products):
-                      logger.info(f"Optimising product {i+1}/{len(products)}: {product.get('title','')[:50]}")
-                      try:
-                          optimised = optimise_listing(product)
-                          results.append({**product, **optimised})
-                      except Exception as e:
-                          logger.error(f"Failed to optimise product {i+1}: {str(e)}")
-                          results.append({**product, 'error': str(e)})
-
-                  # Write optimised CSV to output bucket
+                  results = process_products(products)
                   if results:
-                      timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
-                      output_key = f"optimised/{timestamp}-{key.split('/')[-1]}"
-                      output_buffer = io.StringIO()
-                      fieldnames = list(results[0].keys())
-                      writer = csv.DictWriter(output_buffer, fieldnames=fieldnames)
-                      writer.writeheader()
-                      writer.writerows(results)
-
-                      s3.put_object(
-                          Bucket=OUTPUT_BUCKET,
-                          Key=output_key,
-                          Body=output_buffer.getvalue().encode('utf-8'),
-                          ContentType='text/csv'
-                      )
+                      output_key = write_output_csv(results, key.split('/')[-1])
                       logger.info(f"Output written to s3://{OUTPUT_BUCKET}/{output_key}")
-
-                      # Send SNS notification
                       sns.publish(
                           TopicArn=SNS_TOPIC_ARN,
                           Subject='Product Listing Optimiser - Complete',
-                          Message=f"""Your optimised product listings are ready.
-
-          Input file:  s3://{bucket}/{key}
-          Output file: s3://{OUTPUT_BUCKET}/{output_key}
-          Products processed: {len(results)}
-
-          Download your optimised CSV from the output bucket and upload to Amazon Seller Central.
-          """
+                          Message=f"Optimised {len(results)} products.\nOutput: s3://{OUTPUT_BUCKET}/{output_key}"
                       )
 
               return {'statusCode': 200, 'body': 'Optimisation complete'}
@@ -276,7 +352,7 @@ Resources:
           Value: !Ref ProjectName
 
   # -----------------------------------------------------------
-  # Lambda Permission (allow S3 to invoke Lambda)
+  # Lambda Permission - allow S3 to invoke Lambda
   # -----------------------------------------------------------
 
   LambdaInvokePermission:
@@ -313,50 +389,8 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-optimiser"
       RetentionInDays: 14
 
-# -----------------------------------------------------------
-# Outputs
-# -----------------------------------------------------------
-
-Outputs:
-  InputBucketName:
-    Description: Upload your product CSV files here
-    Value: !Ref InputBucket
-    Export:
-      Name: !Sub "${ProjectName}-input-bucket"
-
-  OutputBucketName:
-    Description: Optimised CSV files will appear here
-    Value: !Ref OutputBucket
-    Export:
-      Name: !Sub "${ProjectName}-output-bucket"
-
-  LambdaFunctionName:
-    Description: Lambda function that runs the optimisation
-    Value: !Ref OptimiserLambda
-    Export:
-      Name: !Sub "${ProjectName}-lambda"
-
-  LambdaFunctionArn:
-    Description: ARN of the Lambda function
-    Value: !GetAtt OptimiserLambda.Arn
-
-  SNSTopicArn:
-    Description: SNS topic for notifications
-    Value: !Ref NotificationTopic
-
-  CloudWatchLogGroup:
-    Description: Lambda logs location
-    Value: !Ref LambdaLogGroup
-
-  ApiEndpoint:
-    Description: API endpoint URL for the website
-    Value: !Sub "https://${ListingOptimiserApi}.execute-api.${AWS::Region}.amazonaws.com/prod/optimise"
-    Export:
-      Name: !Sub "${ProjectName}-api-endpoint"
-
   # -----------------------------------------------------------
-  # API Gateway for website uploads
-  # Add these resources to your existing template.yaml
+  # API Gateway
   # -----------------------------------------------------------
 
   ListingOptimiserApi:
@@ -428,5 +462,43 @@ Outputs:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ListingOptimiserApi}/*/*"
 
+# -----------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------
 
+Outputs:
+  InputBucketName:
+    Description: Upload your product CSV files here
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub "${ProjectName}-input-bucket"
 
+  OutputBucketName:
+    Description: Optimised CSV files will appear here
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub "${ProjectName}-output-bucket"
+
+  LambdaFunctionName:
+    Description: Lambda function that runs the optimisation
+    Value: !Ref OptimiserLambda
+    Export:
+      Name: !Sub "${ProjectName}-lambda"
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt OptimiserLambda.Arn
+
+  SNSTopicArn:
+    Description: SNS topic for notifications
+    Value: !Ref NotificationTopic
+
+  CloudWatchLogGroup:
+    Description: Lambda logs location
+    Value: !Ref LambdaLogGroup
+
+  ApiEndpoint:
+    Description: API endpoint URL for the website
+    Value: !Sub "https://${ListingOptimiserApi}.execute-api.${AWS::Region}.amazonaws.com/prod/optimise"
+    Export:
+      Name: !Sub "${ProjectName}-api-endpoint"

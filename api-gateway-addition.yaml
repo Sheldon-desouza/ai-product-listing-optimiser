@@ -1,0 +1,80 @@
+  # -----------------------------------------------------------
+  # API Gateway for website uploads
+  # Add these resources to your existing template.yaml
+  # -----------------------------------------------------------
+
+  ListingOptimiserApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      Description: API for the product listing optimiser website
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ListingOptimiserApi
+      ParentId: !GetAtt ListingOptimiserApi.RootResourceId
+      PathPart: optimise
+
+  ApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ListingOptimiserApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ListingOptimiserApi
+      ResourceId: !Ref ApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${OptimiserLambda.Arn}/invocations"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiPostMethod
+      - ApiOptionsMethod
+    Properties:
+      RestApiId: !Ref ListingOptimiserApi
+      StageName: prod
+
+  ApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OptimiserLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ListingOptimiserApi}/*/*"
+
+# Add this to your Outputs section:
+  ApiEndpoint:
+    Description: API endpoint URL for the website
+    Value: !Sub "https://${ListingOptimiserApi}.execute-api.${AWS::Region}.amazonaws.com/prod/optimise"
+    Export:
+      Name: !Sub "${ProjectName}-api-endpoint"

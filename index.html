@@ -260,6 +260,12 @@
   <span class="tech-tag">AWS Amplify</span>
 </footer>
 
+<footer style="text-align:center; padding: 20px 32px 32px; font-size: 13px; color: #6b6760;">
+  Created by <a href="https://www.linkedin.com/in/sheldon-desouza/" target="_blank" rel="noopener noreferrer" style="color: #1a6b3c; font-weight: 500; text-decoration: none;">Sheldon De Souza</a>
+  &nbsp;·&nbsp; AWS Cloud &amp; AI Engineer &nbsp;·&nbsp;
+  <a href="https://github.com/Sheldon-desouza/ai-product-listing-optimiser" target="_blank" rel="noopener noreferrer" style="color: #6b6760; text-decoration: none;">View on GitHub</a>
+</footer>
+
 <div class="toast" id="toast"></div>
 
 <script>
@@ -313,6 +319,8 @@
     }).filter(p => p.title || p.asin);
   }
 
+  const API_URL = 'https://34a5iq08zd.execute-api.eu-west-2.amazonaws.com/prod/optimise';
+
   optimiseBtn.addEventListener('click', async () => {
     if (!selectedFile) return;
     const text = await selectedFile.text();
@@ -338,59 +346,61 @@
       </div>`;
     });
 
-    const results = [];
-    for (let i = 0; i < products.length; i++) {
-      const item = document.getElementById('item-' + i);
-      item.classList.add('processing');
-      item.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-      updateProgress(i, products.length, 'Optimising: ' + (products[i].title||'product').substring(0,35) + '...');
-
-      try {
-        const result = await optimiseProduct(products[i]);
-        results.push({...products[i], ...result});
-        item.classList.remove('processing'); item.classList.add('done');
-        document.getElementById('score-' + i).textContent = result.listing_score ? result.listing_score + '/100' : '✓';
-      } catch(err) {
-        results.push({...products[i], error: err.message});
-        item.classList.remove('processing'); item.classList.add('error');
+    // Animate progress while API processes all products at once
+    let fakeIdx = 0;
+    const fakeInterval = setInterval(() => {
+      if (fakeIdx < products.length) {
+        const item = document.getElementById('item-' + fakeIdx);
+        if (fakeIdx > 0) {
+          const prev = document.getElementById('item-' + (fakeIdx-1));
+          prev.classList.remove('processing'); prev.classList.add('done');
+          document.getElementById('score-' + (fakeIdx-1)).textContent = '✓';
+          document.getElementById('progress-count').textContent = fakeIdx + ' / ' + products.length;
+        }
+        item.classList.add('processing');
+        item.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        updateProgress(fakeIdx, products.length, 'Optimising: ' + (products[fakeIdx].title||'product').substring(0,35) + '...');
+        fakeIdx++;
       }
-      document.getElementById('progress-count').textContent = (i+1) + ' / ' + products.length;
-    }
+    }, Math.max(300, 45000 / products.length));
 
-    updateProgress(products.length, products.length, 'Complete');
-    showSuccess(results, Date.now() - startTime);
+    try {
+      const csvText = await selectedFile.text();
+      const response = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: csvText
+      });
+
+      clearInterval(fakeInterval);
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({}));
+        throw new Error(err.error || 'API error ' + response.status);
+      }
+
+      const data = await response.json();
+      if (!data.success) throw new Error(data.error || 'Optimisation failed');
+
+      // Mark all done with scores from preview
+      for (let i = 0; i < products.length; i++) {
+        const item = document.getElementById('item-' + i);
+        item.classList.remove('processing'); item.classList.add('done');
+        const score = data.preview && data.preview[i] ? data.preview[i].listing_score : null;
+        document.getElementById('score-' + i).textContent = score ? score + '/100' : '✓';
+      }
+      document.getElementById('progress-count').textContent = products.length + ' / ' + products.length;
+      updateProgress(products.length, products.length, 'Complete');
+
+      showSuccess(data, Date.now() - startTime);
+
+    } catch(err) {
+      clearInterval(fakeInterval);
+      optimiseBtn.disabled = false;
+      progressSection.classList.remove('visible');
+      showToast('Error: ' + err.message);
+    }
   });
-
-  const API_URL = 'https://34a5iq08zd.execute-api.eu-west-2.amazonaws.com/prod/optimise';
-
-  async function optimiseProduct(product) {
-    const csvRow = Object.keys(product).join(',') + '\n' + Object.values(product).map(v => '"' + (v||'').toString().replace(/"/g,'""') + '"').join(',');
-    const csvWithHeader = 'asin,title,description,brand,category,price\n' +
-      [product.asin||'', product.title||'', product.description||'', product.brand||'', product.category||'', product.price||''].map(v => '"' + v.replace(/"/g,'""') + '"').join(',');
-
-    const response = await fetch(API_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'text/plain' },
-      body: csvWithHeader
-    });
-
-    if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      throw new Error(err.error || 'API error ' + response.status);
-    }
-
-    const data = await response.json();
-    if (!data.success) throw new Error(data.error || 'Optimisation failed');
-
-    return data.preview && data.preview[0] ? {
-      optimised_title: data.preview[0].optimised_title,
-      listing_score: data.preview[0].listing_score,
-      score_notes: data.preview[0].score_notes,
-      bullet_1: '', bullet_2: '', bullet_3: '', bullet_4: '', bullet_5: '',
-      optimised_description: '',
-      download_url: data.download_url
-    } : {};
-  }
 
   function updateProgress(done, total, label) {
     const pct = total > 0 ? Math.round((done/total)*100) : 0;
@@ -399,26 +409,16 @@
     document.getElementById('progress-pct').textContent = pct + '%';
   }
 
-  function showSuccess(results, elapsed) {
+  function showSuccess(data, elapsed) {
     successSection.classList.add('visible');
-    document.getElementById('stat-products').textContent = results.length;
-    const scores = results.map(r => r.listing_score).filter(Boolean);
-    const avg = scores.length ? Math.round(scores.reduce((a,b)=>a+b,0)/scores.length) : null;
-    document.getElementById('stat-avg-score').textContent = avg ? avg + '/100' : '—';
+    document.getElementById('stat-products').textContent = data.products_processed || 0;
+    document.getElementById('stat-avg-score').textContent = data.average_score ? data.average_score + '/100' : '—';
     document.getElementById('stat-time').textContent = Math.round(elapsed/1000) + 's';
-    const csv = toCSV(results);
-    const blob = new Blob([csv], {type:'text/csv'});
-    const url = URL.createObjectURL(blob);
     const btn = document.getElementById('download-btn');
-    btn.href = url; btn.download = 'optimised-listings-' + Date.now() + '.csv';
+    btn.href = data.download_url;
+    btn.removeAttribute('download');
+    btn.target = '_blank';
     successSection.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  }
-
-  function toCSV(data) {
-    if (!data.length) return '';
-    const keys = Object.keys(data[0]);
-    const rows = data.map(r => keys.map(k => '"' + (r[k]||'').toString().replace(/"/g,'""') + '"').join(','));
-    return [keys.join(','), ...rows].join('\n');
   }
 
   document.getElementById('reset-btn').addEventListener('click', () => {

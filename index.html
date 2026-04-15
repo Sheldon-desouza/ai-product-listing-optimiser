@@ -361,22 +361,36 @@
     showSuccess(results, Date.now() - startTime);
   });
 
-  async function optimiseProduct(product) {
-    await delay(3500 + Math.random() * 2000);
-    return {
-      optimised_title: product.brand + ' ' + product.title + ' | Premium Quality | UK Stock',
-      bullet_1: 'GENUINE PRODUCT: Official ' + product.brand + ' product with full manufacturer warranty',
-      bullet_2: 'FAST UK DISPATCH: Same-day dispatch on orders before 2pm, Prime eligible',
-      bullet_3: 'TRUSTED BRAND: ' + product.brand + ' is trusted by thousands of UK customers',
-      bullet_4: 'EASY RETURNS: 30-day hassle-free returns with full customer support',
-      bullet_5: 'QUALITY GUARANTEE: Every product quality checked before dispatch',
-      optimised_description: product.brand + ' ' + product.title + '. ' + product.description + '. Shop with confidence from an authorised UK seller.',
-      listing_score: Math.floor(73 + Math.random() * 21),
-      score_notes: 'Title expanded with keywords. Bullets rewritten benefit-led. Description optimised for Rufus AI.'
-    };
-  }
+  const API_URL = 'https://34a5iq08zd.execute-api.eu-west-2.amazonaws.com/prod/optimise';
 
-  function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+  async function optimiseProduct(product) {
+    const csvRow = Object.keys(product).join(',') + '\n' + Object.values(product).map(v => '"' + (v||'').toString().replace(/"/g,'""') + '"').join(',');
+    const csvWithHeader = 'asin,title,description,brand,category,price\n' +
+      [product.asin||'', product.title||'', product.description||'', product.brand||'', product.category||'', product.price||''].map(v => '"' + v.replace(/"/g,'""') + '"').join(',');
+
+    const response = await fetch(API_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain' },
+      body: csvWithHeader
+    });
+
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error || 'API error ' + response.status);
+    }
+
+    const data = await response.json();
+    if (!data.success) throw new Error(data.error || 'Optimisation failed');
+
+    return data.preview && data.preview[0] ? {
+      optimised_title: data.preview[0].optimised_title,
+      listing_score: data.preview[0].listing_score,
+      score_notes: data.preview[0].score_notes,
+      bullet_1: '', bullet_2: '', bullet_3: '', bullet_4: '', bullet_5: '',
+      optimised_description: '',
+      download_url: data.download_url
+    } : {};
+  }
 
   function updateProgress(done, total, label) {
     const pct = total > 0 ? Math.round((done/total)*100) : 0;

@@ -1,0 +1,349 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AI-Powered Product Listing Optimiser
+  Uploads a product CSV to S3, triggers Lambda, rewrites listings via Bedrock,
+  outputs optimised CSV and sends email notification via SES.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: listing-optimiser
+    Description: Used as a prefix for all resource names
+
+  NotificationEmail:
+    Type: String
+    Description: Email address to receive optimised listing notifications
+    Default: your-email@example.com
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Description: Bedrock model ID to use for listing optimisation
+
+Resources:
+
+  # -----------------------------------------------------------
+  # S3 Buckets
+  # -----------------------------------------------------------
+
+  InputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-input-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldInputFiles
+            Status: Enabled
+            ExpirationInDays: 30
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .csv
+            Function: !GetAtt OptimiserLambda.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: dev
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-output-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldOutputFiles
+            Status: Enabled
+            ExpirationInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: dev
+
+  # -----------------------------------------------------------
+  # IAM Role for Lambda
+  # -----------------------------------------------------------
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "${ProjectName}-lambda-policy"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+
+              # Read from input bucket
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-input-${AWS::AccountId}/*"
+
+              # Write to output bucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-output-${AWS::AccountId}/*"
+
+              # Invoke Bedrock model
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}"
+
+              # Publish to SNS topic
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+              # Write logs to CloudWatch
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-optimiser:*"
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -----------------------------------------------------------
+  # Lambda Function
+  # -----------------------------------------------------------
+
+  OptimiserLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-optimiser"
+      Description: Triggered by S3 upload; reads product CSV, calls Bedrock, writes optimised CSV
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          OUTPUT_BUCKET: !Ref OutputBucket
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import json
+          import csv
+          import boto3
+          import os
+          import logging
+          import io
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(os.environ.get('LOG_LEVEL', 'INFO'))
+
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock-runtime')
+          sns = boto3.client('sns')
+
+          OUTPUT_BUCKET = os.environ['OUTPUT_BUCKET']
+          SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+          BEDROCK_MODEL_ID = os.environ['BEDROCK_MODEL_ID']
+
+          def optimise_listing(product):
+              """Send a single product to Bedrock for listing optimisation."""
+              prompt = f"""You are an expert Amazon listing copywriter.
+          Optimise the following product listing for Amazon search (Rufus/A9 algorithm).
+
+          Return ONLY valid JSON with these fields:
+          - optimised_title (max 200 chars, keyword-rich)
+          - bullet_1 through bullet_5 (benefit-led, max 255 chars each)
+          - optimised_description (max 2000 chars, paragraph form)
+          - listing_score (integer 0-100)
+          - score_notes (brief improvement notes)
+
+          Product data:
+          Title: {product.get('title', '')}
+          Description: {product.get('description', '')}
+          Brand: {product.get('brand', '')}
+          Category: {product.get('category', '')}
+          Price: {product.get('price', '')}
+          ASIN: {product.get('asin', '')}
+
+          Return only the JSON object, no markdown, no preamble."""
+
+              body = json.dumps({
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 1500,
+                  "messages": [{"role": "user", "content": prompt}]
+              })
+
+              response = bedrock.invoke_model(
+                  modelId=BEDROCK_MODEL_ID,
+                  body=body,
+                  contentType='application/json',
+                  accept='application/json'
+              )
+
+              result = json.loads(response['body'].read())
+              text = result['content'][0]['text']
+              return json.loads(text)
+
+          def handler(event, context):
+              logger.info(f"Event received: {json.dumps(event)}")
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  logger.info(f"Processing file: s3://{bucket}/{key}")
+
+                  # Read CSV from input bucket
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  content = obj['Body'].read().decode('utf-8')
+                  reader = csv.DictReader(io.StringIO(content))
+                  products = list(reader)
+                  logger.info(f"Found {len(products)} products to optimise")
+
+                  # Optimise each product
+                  results = []
+                  for i, product in enumerate(products):
+                      logger.info(f"Optimising product {i+1}/{len(products)}: {product.get('title','')[:50]}")
+                      try:
+                          optimised = optimise_listing(product)
+                          results.append({**product, **optimised})
+                      except Exception as e:
+                          logger.error(f"Failed to optimise product {i+1}: {str(e)}")
+                          results.append({**product, 'error': str(e)})
+
+                  # Write optimised CSV to output bucket
+                  if results:
+                      timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+                      output_key = f"optimised/{timestamp}-{key.split('/')[-1]}"
+                      output_buffer = io.StringIO()
+                      fieldnames = list(results[0].keys())
+                      writer = csv.DictWriter(output_buffer, fieldnames=fieldnames)
+                      writer.writeheader()
+                      writer.writerows(results)
+
+                      s3.put_object(
+                          Bucket=OUTPUT_BUCKET,
+                          Key=output_key,
+                          Body=output_buffer.getvalue().encode('utf-8'),
+                          ContentType='text/csv'
+                      )
+                      logger.info(f"Output written to s3://{OUTPUT_BUCKET}/{output_key}")
+
+                      # Send SNS notification
+                      sns.publish(
+                          TopicArn=SNS_TOPIC_ARN,
+                          Subject='Product Listing Optimiser - Complete',
+                          Message=f"""Your optimised product listings are ready.
+
+          Input file:  s3://{bucket}/{key}
+          Output file: s3://{OUTPUT_BUCKET}/{output_key}
+          Products processed: {len(results)}
+
+          Download your optimised CSV from the output bucket and upload to Amazon Seller Central.
+          """
+                      )
+
+              return {'statusCode': 200, 'body': 'Optimisation complete'}
+
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -----------------------------------------------------------
+  # Lambda Permission (allow S3 to invoke Lambda)
+  # -----------------------------------------------------------
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OptimiserLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub "arn:aws:s3:::${ProjectName}-input-${AWS::AccountId}"
+
+  # -----------------------------------------------------------
+  # SNS Topic for Notifications
+  # -----------------------------------------------------------
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-notifications"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -----------------------------------------------------------
+  # CloudWatch Log Group
+  # -----------------------------------------------------------
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-optimiser"
+      RetentionInDays: 14
+
+# -----------------------------------------------------------
+# Outputs
+# -----------------------------------------------------------
+
+Outputs:
+  InputBucketName:
+    Description: Upload your product CSV files here
+    Value: !Ref InputBucket
+    Export:
+      Name: !Sub "${ProjectName}-input-bucket"
+
+  OutputBucketName:
+    Description: Optimised CSV files will appear here
+    Value: !Ref OutputBucket
+    Export:
+      Name: !Sub "${ProjectName}-output-bucket"
+
+  LambdaFunctionName:
+    Description: Lambda function that runs the optimisation
+    Value: !Ref OptimiserLambda
+    Export:
+      Name: !Sub "${ProjectName}-lambda"
+
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt OptimiserLambda.Arn
+
+  SNSTopicArn:
+    Description: SNS topic for notifications
+    Value: !Ref NotificationTopic
+
+  CloudWatchLogGroup:
+    Description: Lambda logs location
+    Value: !Ref LambdaLogGroup

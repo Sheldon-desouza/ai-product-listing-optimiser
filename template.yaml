@@ -348,7 +348,13 @@ Outputs:
     Description: Lambda logs location
     Value: !Ref LambdaLogGroup
 
-      # -----------------------------------------------------------
+  ApiEndpoint:
+    Description: API endpoint URL for the website
+    Value: !Sub "https://${ListingOptimiserApi}.execute-api.${AWS::Region}.amazonaws.com/prod/optimise"
+    Export:
+      Name: !Sub "${ProjectName}-api-endpoint"
+
+  # -----------------------------------------------------------
   # API Gateway for website uploads
   # Add these resources to your existing template.yaml
   # -----------------------------------------------------------
@@ -422,10 +428,5 @@ Outputs:
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ListingOptimiserApi}/*/*"
 
-# Add this to your Outputs section:
-  ApiEndpoint:
-    Description: API endpoint URL for the website
-    Value: !Sub "https://${ListingOptimiserApi}.execute-api.${AWS::Region}.amazonaws.com/prod/optimise"
-    Export:
-      Name: !Sub "${ProjectName}-api-endpoint"
+
 

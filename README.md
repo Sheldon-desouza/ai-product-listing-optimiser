@@ -27,40 +27,43 @@ Built by [Sheldon De Souza](https://www.linkedin.com/in/sheldon-desouza/) — tr
 
 ---
 
-## The Problem
-
-Writing high-quality Amazon listings is time-consuming and inconsistent. Most sellers do it manually or pay expensive copywriters. Poor listings directly impact search ranking, click-through rate, and conversion.
-
-This project automates the entire process using AWS-native AI services, and is grounded in real eCommerce experience working with brands like Veloforte and V12 Footwear.
-
----
-
 ## Architecture
 
-```
-+-----------------------------------------------------------------+
-|                          AWS Cloud                              |
-|                                                                 |
-|  Website         API Gateway       Orchestrator Lambda          |
-|  (Amplify) ────► POST /optimise ──► Creates job in DynamoDB    |
-|                                     Triggers Processor async    |
-|                  Returns job ID ◄── Returns 202 instantly      |
-|                                                                 |
-|  Website polls   API Gateway       Orchestrator Lambda          |
-|  every 3s  ────► GET ?job_id=x ──► Reads DynamoDB status       |
-|                  Returns progress ◄ Returns % complete          |
-|                                                                 |
-|                                    Processor Lambda             |
-|                                    Calls Bedrock per product    |
-|                                    Updates DynamoDB progress    |
-|                                    Writes output CSV to S3      |
-|                                    Sends SNS notification       |
-+-----------------------------------------------------------------+
-```
+![Architecture Diagram](assets/architecture-diagram.png)
 
 ### Why async?
 
 API Gateway has a hard 29-second timeout. Processing 10 products through Bedrock takes 45-60 seconds. The async pattern solves this: the website gets a job ID back in under 1 second, then polls for real-time progress while the Processor Lambda runs in the background with no timeout pressure.
+
+```
+Website → POST /optimise → Orchestrator Lambda → creates DynamoDB job → returns job ID (<1s)
+Website → GET ?job_id=x  → Orchestrator Lambda → reads DynamoDB → returns % complete
+                                                   Processor Lambda → calls Bedrock per product
+                                                                    → updates DynamoDB progress
+                                                                    → writes output CSV to S3
+```
+
+---
+
+## CloudFormation Stack — 17 Resources
+
+![CloudFormation Resources](assets/cf-resources.png)
+
+---
+
+## Lambda Functions
+
+### Orchestrator — returns job ID instantly
+![Orchestrator Lambda](assets/lambda-orchestrator.png)
+
+### Processor — runs async, 300 second timeout
+![Processor Lambda](assets/lambda-processor.png)
+
+---
+
+## DynamoDB — Job Tracking Table
+
+![DynamoDB](assets/dynamodb.png)
 
 ---
 
@@ -74,39 +77,33 @@ API Gateway has a hard 29-second timeout. Processing 10 products through Bedrock
 | Amazon DynamoDB | Tracks job status and real-time progress |
 | Amazon API Gateway | REST API with CORS for the website |
 | Amazon SNS | Email notification on job completion |
-| AWS Amplify | Hosts the frontend website |
+| AWS Amplify | Hosts the live frontend website |
 | AWS CloudFormation | Full infrastructure as code, single template deployment |
 | AWS IAM | Least privilege roles and policies |
 | Amazon CloudWatch | Lambda logs and monitoring |
 
 ---
 
-## What Gets Optimised
+## Repo Structure
 
-Each product is rewritten to meet Amazon best practices for search visibility (A9/Rufus algorithm):
-
-| Field | Before | After |
-|---|---|---|
-| Title | `Nike running shoe mens` | `Nike Air Max 270 Men's Running Shoe, Lightweight Breathable Mesh, Max Air Cushioning` |
-| Bullet 1 | `Good for running` | `SUPERIOR CUSHIONING: Large Max Air unit delivers all-day comfort and impact absorption` |
-| Description | `Lightweight shoe` | `Engineered for performance and everyday style, the Nike Air Max 270...` |
-| Score | — | `92/100 with improvement notes` |
-
----
-
-## Live Demo
-
-Visit [main.dr87o9j4s7beg.amplifyapp.com](https://main.dr87o9j4s7beg.amplifyapp.com/) and upload the included `sample-products.csv` to see it in action.
+```
+index.html              ← Demo version (5 products, powers live Amplify site)
+full-version/
+  index.html            ← Full version (no limit, for self-hosting)
+  template.yaml         ← CloudFormation stack
+  DEPLOY.md             ← Deployment guide
+template.yaml           ← CloudFormation stack
+sample-products.csv     ← 10 real products for testing
+DEPLOY.md               ← Deployment guide
+README.md               ← This file
+assets/                 ← Screenshots
+```
 
 ---
 
-## Deploy Your Own
+## Deploy Your Own (No Limits)
 
-### Prerequisites
-
-- AWS account with Bedrock enabled
-- AWS CLI installed and configured
-- Git
+Use the files in the `full-version/` folder for a self-hosted unlimited version.
 
 ### Step 1: Clone the repo
 
@@ -119,7 +116,7 @@ cd ai-product-listing-optimiser
 
 ```bash
 aws cloudformation deploy \
-  --template-file template.yaml \
+  --template-file full-version/template.yaml \
   --stack-name listing-optimiser \
   --parameter-overrides \
       ProjectName=listing-optimiser \
@@ -139,7 +136,15 @@ aws cloudformation describe-stacks \
   --region eu-west-2
 ```
 
-### Step 4: Update index.html with your API URL, push to GitHub, connect to Amplify.
+### Step 4: Update the frontend
+
+Open `full-version/index.html` and replace `YOUR_API_GATEWAY_URL` with your API URL.
+
+### Step 5: Deploy to Amplify
+
+Push to GitHub and connect your repo to AWS Amplify. Auto-deploys on every push.
+
+See [DEPLOY.md](DEPLOY.md) for the full step-by-step guide including IAM permissions fix.
 
 ---
 
@@ -150,7 +155,7 @@ asin,title,description,brand,category,price
 B09B8YWXTS,Instant Pot Duo 7-in-1,Multi cooker...,Instant Pot,Kitchen Appliances,79.99
 ```
 
-Required: `title`, `description`, `brand`, `category`. Optional: `asin`, `price`
+Required: `title`, `description`, `brand`, `category` — Optional: `asin`, `price`
 
 ---
 
@@ -172,8 +177,20 @@ Required: `title`, `description`, `brand`, `category`. Optional: `asin`, `price`
 |---|---|
 | Lambda, DynamoDB, SNS, API Gateway | ~$0.00 (free tier) |
 | S3 | ~$0.01 |
-| Bedrock Claude 3 Haiku | ~$0.05-$0.20 |
+| Bedrock Claude 3 Haiku | ~$0.05–$0.20 |
 | **Total** | **Under $0.25** |
+
+> Claude 3 Haiku at $0.25/M tokens is 12x cheaper than Claude 3 Sonnet and perfectly capable for structured copywriting tasks.
+
+---
+
+## Tear Down
+
+```bash
+aws s3 rm s3://listing-optimiser-input-YOUR_ACCOUNT_ID --recursive
+aws s3 rm s3://listing-optimiser-output-YOUR_ACCOUNT_ID --recursive
+aws cloudformation delete-stack --stack-name listing-optimiser
+```
 
 ---
 
@@ -182,6 +199,7 @@ Required: `title`, `description`, `brand`, `category`. Optional: `asin`, `price`
 - [x] Async architecture with DynamoDB job tracking
 - [x] Real-time progress bar with per-product updates
 - [x] Live website on AWS Amplify
+- [x] Demo version with 5-product limit and sample data
 - [ ] Amazon Rekognition to score product images
 - [ ] Multi-marketplace mode (Amazon, Shopify, eBay)
 - [ ] RAG pipeline using brand guidelines as context
@@ -201,4 +219,4 @@ Built as part of the AWS re/Start Cloud Engineering Programme (Cohort GBLON18).
 
 **Sheldon De Souza** — AWS Cloud & AI Engineer (in Training) | eCommerce Technology Specialist
 
-[LinkedIn](https://www.linkedin.com/in/sheldon-desouza/) · [GitHub](https://github.com/Sheldon-desouza)
+[LinkedIn](https://www.linkedin.com/in/sheldon-desouza/) · [GitHub](https://github.com/Sheldon-desouza) · [Live Demo](https://main.dr87o9j4s7beg.amplifyapp.com/)

@@ -60,11 +60,6 @@
   .btn-primary { width: 100%; margin-top: 20px; padding: 14px 24px; background: var(--black); color: var(--white); border: none; border-radius: var(--radius-sm); font-family: 'DM Sans', sans-serif; font-size: 14px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; justify-content: center; gap: 8px; letter-spacing: -0.2px; }
   .btn-primary:hover:not(:disabled) { background: var(--gray-800); transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.15); }
   .btn-primary:disabled { background: var(--gray-200); color: var(--gray-400); cursor: not-allowed; }
-  .btn-sample { width: 100%; margin-top: 10px; padding: 11px 24px; background: transparent; color: var(--accent); border: 1.5px solid var(--accent); border-radius: var(--radius-sm); font-family: 'DM Sans', sans-serif; font-size: 13px; font-weight: 500; cursor: pointer; transition: all 0.2s ease; display: flex; align-items: center; justify-content: center; gap: 8px; }
-  .btn-sample:hover { background: var(--accent-light); }
-  .demo-notice { margin-top: 10px; padding: 10px 14px; background: #fffbeb; border: 1px solid #fde68a; border-radius: var(--radius-sm); font-size: 12px; color: #92400e; text-align: center; line-height: 1.6; }
-  .demo-notice a { color: var(--accent); font-weight: 500; text-decoration: none; }
-  .demo-notice a:hover { text-decoration: underline; }
   #progress-section { display: none; margin-top: 16px; }
   #progress-section.visible { display: block; }
   .progress-header { padding: 20px 28px 16px; border-bottom: 1px solid var(--gray-100); display: flex; align-items: center; justify-content: space-between; }
@@ -194,18 +189,6 @@
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
         Optimise listings
       </button>
-
-      <button class="btn-sample" id="sample-btn">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
-        Try with sample products
-      </button>
-
-      <div class="demo-notice">
-        Demo limited to 5 products. Want to run unlimited?
-        <a href="https://github.com/Sheldon-desouza/ai-product-listing-optimiser" target="_blank">Deploy your own free on GitHub &#8599;</a>
-        &nbsp;or&nbsp;
-        <a href="https://www.linkedin.com/in/sheldon-desouza/" target="_blank">contact me to build one for you &#8599;</a>
-      </div>
     </div>
   </div>
 
@@ -311,22 +294,9 @@
   function setFile(file) {
     selectedFile = file;
     document.getElementById('file-name-display').textContent = file.name;
+    document.getElementById('file-size-display').textContent = formatBytes(file.size);
     fileSelected.classList.add('visible');
     optimiseBtn.disabled = false;
-    const reader = new FileReader();
-    reader.onload = e => {
-      const lines = e.target.result.trim().split('\n').filter(l => l.trim());
-      const total = Math.max(0, lines.length - 1);
-      const willProcess = Math.min(total, DEMO_LIMIT);
-      if (total > DEMO_LIMIT) {
-        document.getElementById('file-size-display').textContent =
-          total + ' products found — optimising first ' + willProcess;
-      } else {
-        document.getElementById('file-size-display').textContent =
-          total + ' product' + (total !== 1 ? 's' : '') + ' — ' + formatBytes(file.size);
-      }
-    };
-    reader.readAsText(file);
   }
 
   document.getElementById('file-remove').addEventListener('click', () => {
@@ -340,30 +310,14 @@
     return (b/1048576).toFixed(1) + ' MB';
   }
 
-  const DEMO_LIMIT = 5;
-
   function parseCSV(text) {
     const lines = text.trim().split('\n');
     const headers = lines[0].split(',').map(h => h.trim().replace(/"/g,''));
-    return lines.slice(1, DEMO_LIMIT + 1).map(line => {
+    return lines.slice(1).map(line => {
       const vals = line.split(',').map(v => v.trim().replace(/"/g,''));
       const obj = {}; headers.forEach((h,i) => obj[h] = vals[i]||''); return obj;
     }).filter(p => p.title || p.asin);
   }
-
-  const SAMPLE_CSV = `asin,title,description,brand,category,price
-B09B8YWXTS,Instant Pot Duo 7-in-1,Multi cooker pressure cooker slow cooker rice cooker steamer saute and warmer 6 quart,Instant Pot,Kitchen Appliances,79.99
-B07FZ8S74R,Fitbit Charge 5,Advanced fitness and health tracker with built in GPS stress management tools and sleep tracking,Fitbit,Fitness Trackers,129.99
-B08N5WRWNW,Echo Dot 4th Gen,Smart speaker with Alexa clock display and improved audio,Amazon,Smart Speakers,49.99
-B09G9HD6PD,Anker 65W USB C Charger,Compact fast charger with foldable plug for laptop phone and tablet charging,Anker,Phone Accessories,35.99
-B07ZPKBL9V,Neutrogena Hydro Boost Face Moisturiser,Water gel moisturiser with hyaluronic acid for dry skin hydration all day,Neutrogena,Skincare,18.99`;
-
-  document.getElementById('sample-btn').addEventListener('click', () => {
-    const blob = new Blob([SAMPLE_CSV], { type: 'text/csv' });
-    const file = new File([blob], 'sample-products.csv', { type: 'text/csv' });
-    setFile(file);
-    showToast('5 sample products loaded. Click Optimise listings to run the demo.');
-  });
 
   const API_URL = 'https://34a5iq08zd.execute-api.eu-west-2.amazonaws.com/prod/optimise';
 
